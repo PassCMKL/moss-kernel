@@ -68,6 +68,7 @@ impl Ord for Instant {
     }
 }
 
+#[allow(dead_code)]
 enum WakeupKind {
     ///  This scheduled wake up is for an async task.
     Task(Waker),
@@ -232,6 +233,7 @@ impl SysTimer {
     }
 
     /// Schedule a preemption event for the current CPU.
+    #[allow(dead_code)]
     pub fn schedule_preempt(&self, when: Instant) {
         let mut wake_q = WAKEUP_Q.borrow_mut();
 
@@ -300,6 +302,7 @@ pub fn kick_current_cpu() {
 
 /// Arms a preemption timer for the running task on this CPU.
 /// Called by the scheduler every time it issues a new eligible virtual deadline.
+#[allow(dead_code)]
 pub fn schedule_preempt(when: Instant) {
     if let Some(timer) = SYS_TIMER.get() {
         timer.schedule_preempt(when);

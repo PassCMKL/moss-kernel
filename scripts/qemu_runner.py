@@ -26,7 +26,7 @@ subprocess.run(["aarch64-none-elf-objcopy", "-O", "binary", elf_executable, bin_
 
 append_args = ""
 
-if args.init.split("/")[-1] in ["bash", "sh"]:
+if args.init.split("/")[-1] in ["bash", "sh", "ash"]:
     append_args = f"--init={args.init} --init-arg=-i"
 else:
     append_args = f"--init={args.init}"

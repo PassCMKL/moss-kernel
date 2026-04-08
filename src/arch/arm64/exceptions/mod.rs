@@ -7,8 +7,7 @@ use crate::{
     interrupts::get_interrupt_root,
     ksym_pa,
     memory::PAGE_ALLOC,
-    sched::{current::current_task, uspc_ret::dispatch_userspace_task},
-    spawn_kernel_work,
+    sched::{current::current_task, spawn_kernel_work, uspc_ret::dispatch_userspace_task},
 };
 use aarch64_cpu::registers::{CPACR_EL1, ReadWriteable, VBAR_EL1};
 use core::{arch::global_asm, fmt::Display};

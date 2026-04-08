@@ -12,6 +12,7 @@ use crate::{
 use alloc::{boxed::Box, collections::btree_map::BTreeMap, sync::Arc};
 use core::fmt::Debug;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "smp")]
 use core::time::Duration;
 use current::{CUR_TASK_PTR, current_task};
 use libkernel::{UserAddressSpace, error::Result};
@@ -73,21 +74,15 @@ per_cpu_private! {
     static SCHED_STATE: SchedState = SchedState::new;
 }
 
-/// Default time-slice assigned to runnable tasks.
-const DEFAULT_TIME_SLICE: Duration = Duration::from_millis(4);
+/// Run-queue eligibility tolerance used by the run-queue filter.
+///
+/// In Round-Robin every task has `v_eligible = 0` and the virtual clock is
+/// always 0, so this check is always trivially satisfied (0 ≤ u128::MAX/2).
+/// The constant is kept so `runqueue.rs` compiles unchanged.
+pub const VCLOCK_EPSILON: u128 = u128::MAX / 2;
 
-/// Fixed-point configuration for virtual-time accounting.
-/// We now use a 65.63 format (65 integer bits, 63 fractional bits) as
-/// recommended by the EEVDF paper to minimise rounding error accumulation.
-pub const VT_FIXED_SHIFT: u32 = 63;
-pub const VT_ONE: u128 = 1u128 << VT_FIXED_SHIFT;
-/// Tolerance used when comparing virtual-time values (see EEVDF, Fixed-Point Arithmetic).
-/// Two virtual-time instants whose integer parts differ by no more than this constant are considered equal.
-pub const VCLOCK_EPSILON: u128 = VT_ONE;
-
-/// Scheduler base weight to ensure tasks always have a strictly positive
-/// scheduling weight. The value is added to a task's priority to obtain its
-/// effective weight (`w_i` in EEVDF paper).
+/// Scheduler base weight.  In Round-Robin all non-idle tasks have equal
+/// weight, so this constant is used uniformly.
 pub const SCHED_WEIGHT_BASE: i32 = 1024;
 
 /// Schedule a new task.
@@ -167,12 +162,7 @@ pub fn insert_task_cross_cpu(task: Box<OwnedTask>) {
 pub struct SchedState {
     run_q: RunQueue,
     wait_q: BTreeMap<TaskDescriptor, Box<SchedulableTask>>,
-    /// Per-CPU virtual clock (fixed-point 65.63 stored in a u128).
-    /// Expressed in virtual-time units as defined by the EEVDF paper.
-    vclock: u128,
-    /// Real-time moment when `vclock` was last updated.
-    last_update: Option<Instant>,
-    /// Force a reschedule.
+    /// Force a reschedule on the next scheduling opportunity.
     force_resched: bool,
 }
 
@@ -183,8 +173,6 @@ impl SchedState {
         Self {
             run_q: RunQueue::new(),
             wait_q: BTreeMap::new(),
-            vclock: 0,
-            last_update: None,
             force_resched: false,
         }
     }
@@ -245,35 +233,17 @@ impl SchedState {
         // No-op on single-core systems.
     }
 
-    /// Advance the per-CPU virtual clock (`vclock`) by converting the elapsed
-    /// real time since the last update into 65.63-format fixed-point
-    /// virtual-time units:
-    ///     v += (delta t << VT_FIXED_SHIFT) /  sum w
-    /// The caller must pass the current real time (`now_inst`).
-    fn advance_vclock(&mut self, now_inst: Instant) {
-        if let Some(prev) = self.last_update {
-            let delta_real = now_inst - prev;
-            if self.run_q.weight() > 0 {
-                let delta_vt =
-                    ((delta_real.as_nanos()) << VT_FIXED_SHIFT) / self.run_q.weight() as u128;
-                self.vclock = self.vclock.saturating_add(delta_vt);
-            }
-        }
-        self.last_update = Some(now_inst);
-    }
-
     fn insert_into_runq(&mut self, mut new_task: Box<SchedulableTask>) {
-        let now = now().expect("systimer not running");
-
-        self.advance_vclock(now);
-
-        new_task.inserting_into_runqueue(self.vclock);
+        // In Round-Robin the virtual clock is not used; pass 0.
+        // inserting_into_runqueue() internally captures the real timestamp for
+        // FIFO ordering and wait-time metrics.
+        new_task.inserting_into_runqueue(0);
 
         if let Some(current) = self.run_q.current() {
-            // We force a reschedule if:
-            //
-            // We are currently idling, OR The new task has an earlier deadline
-            // than the current task.
+            // Force a reschedule if we are currently idling (any real task
+            // should preempt the idle task), or if the new task's enqueue
+            // timestamp is earlier than the current task's (shouldn't happen
+            // in normal operation but handled defensively).
             if current.is_idle_task() || new_task.v_deadline < current.v_deadline {
                 self.force_resched = true;
             }
@@ -298,10 +268,7 @@ impl SchedState {
 
     pub fn do_schedule(&mut self) {
         self.update_global_least_tasked_cpu_info();
-        // Update Clocks
         let now_inst = now().expect("System timer not initialised");
-
-        self.advance_vclock(now_inst);
 
         let mut needs_resched = self.force_resched;
 
@@ -335,7 +302,9 @@ impl SchedState {
         self.force_resched = false;
 
         // Select Next Task.
-        let next_task_desc = self.run_q.find_next_runnable_desc(self.vclock);
+        // In Round-Robin, v_eligible is always 0 and vclock is unused; pass 0.
+        let allow_current = !needs_resched;
+        let next_task_desc = self.run_q.find_next_runnable_desc(0, allow_current);
 
         match self.run_q.switch_tasks(next_task_desc, now_inst) {
             SwitchResult::AlreadyRunning => {
@@ -345,7 +314,9 @@ impl SchedState {
             SwitchResult::Blocked { old_task } => {
                 // If the blocked task has finished, allow it to drop here so it's
                 // resources are released.
-                if !old_task.state.lock_save_irq().is_finished() {
+                if old_task.state.lock_save_irq().is_finished() {
+                    sched_task::print_task_metrics(&old_task);
+                } else {
                     self.wait_q.insert(old_task.descriptor(), old_task);
                 }
             }

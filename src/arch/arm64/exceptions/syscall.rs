@@ -1,3 +1,80 @@
+// ---------------------------------------------------------------------------
+// Level 3 & 4 — syscall history tracking
+// ---------------------------------------------------------------------------
+
+use alloc::{
+    boxed::Box,
+    collections::VecDeque,
+    format,
+    string::String,
+    vec::Vec,
+};
+use core::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use crate::sync::SpinLock;
+
+/// Maximum number of bytes kept in the syscall ring buffer.
+const SYSCALL_LOG_MAX_BYTES: usize = 8192;
+
+/// Heap-backed ring buffer for formatted syscall history entries.
+struct SyscallLog {
+    entries: VecDeque<String>,
+    total_bytes: usize,
+}
+
+impl SyscallLog {
+    const fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            total_bytes: 0,
+        }
+    }
+
+    fn push(&mut self, mut entry: String) {
+        if entry.len() > SYSCALL_LOG_MAX_BYTES {
+            entry = entry.split_off(entry.len() - SYSCALL_LOG_MAX_BYTES);
+        }
+
+        while self.total_bytes + entry.len() > SYSCALL_LOG_MAX_BYTES {
+            let Some(oldest) = self.entries.pop_front() else {
+                break;
+            };
+            self.total_bytes = self.total_bytes.saturating_sub(oldest.len());
+        }
+
+        self.total_bytes += entry.len();
+        self.entries.push_back(entry);
+    }
+
+    fn snapshot_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.total_bytes);
+        for entry in &self.entries {
+            out.extend_from_slice(entry.as_bytes());
+        }
+        out
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.total_bytes = 0;
+    }
+}
+
+/// Ring buffer that records the last `SYSCALL_RING_MAX` syscalls.
+///
+/// Backed by `VecDeque`, which allocates from the kernel heap — itself
+/// serviced by the SLAB allocator.  When full, the oldest entry is evicted
+/// from the front before pushing the new one onto the back.
+static SYSCALL_LOG: SpinLock<SyscallLog> = SpinLock::new(SyscallLog::new());
+
+/// Stores the number of the most recently *completed* syscall.
+///
+/// Updated at the end of every syscall dispatch (including the early-return
+/// paths for `exit` and `sigreturn`).  The `syslog` handler (0x74) reads
+/// this to report the previous syscall.
+static PREV_SYSCALL: AtomicU32 = AtomicU32::new(0);
+
+// ---------------------------------------------------------------------------
+
 use crate::{
     arch::{Arch, ArchImpl},
     clock::{
@@ -54,6 +131,7 @@ use crate::{
         mincore::sys_mincore,
         mmap::{sys_mmap, sys_mprotect, sys_munmap},
         process_vm::sys_process_vm_readv,
+        uaccess::copy_to_user_slice,
     },
     process::{
         TaskState,
@@ -90,11 +168,58 @@ use crate::{
     },
     sched::{current::current_task, sys_sched_yield},
 };
-use alloc::boxed::Box;
 use libkernel::{
     error::{KernelError, syscall_error::kern_err_to_syscall},
     memory::address::{TUA, UA, VA},
 };
+
+fn record_syscall(nr: u32) {
+    let pid = current_task().descriptor().tgid().value() as u32;
+    let timestamp = crate::drivers::timer::now()
+        .map(|instant| instant.ticks())
+        .unwrap_or(0);
+    let mut log = SYSCALL_LOG.lock_save_irq();
+    log.push(format!("syscall=0x{nr:x} pid={pid} ts={timestamp}\n"));
+}
+
+async fn sys_syslog(action: u64, buf: u64, len: u64) -> libkernel::error::Result<usize> {
+    const SYSLOG_ACTION_READ_ALL: u64 = 3;
+    const SYSLOG_ACTION_READ_CLEAR: u64 = 4;
+    const SYSLOG_ACTION_SIZE_UNREAD: u64 = 9;
+    const SYSLOG_ACTION_SIZE_BUFFER: u64 = 10;
+
+    let prev = PREV_SYSCALL.load(AtomicOrdering::Relaxed);
+    log::info!("[syslog] previous syscall: 0x{prev:x} ({prev})");
+
+    match action {
+        SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
+            let len = usize::try_from(len).map_err(|_| KernelError::InvalidValue)?;
+            if len == 0 {
+                return Ok(0);
+            }
+
+            let snapshot = {
+                let log = SYSCALL_LOG.lock_save_irq();
+                log.snapshot_bytes()
+            };
+            let copy_len = snapshot.len().min(len);
+
+            if copy_len != 0 {
+                copy_to_user_slice(&snapshot[..copy_len], UA::from_value(buf as usize)).await?;
+            }
+
+            if action == SYSLOG_ACTION_READ_CLEAR {
+                SYSCALL_LOG.lock_save_irq().clear();
+            }
+
+            Ok(copy_len)
+        }
+        SYSLOG_ACTION_SIZE_UNREAD | SYSLOG_ACTION_SIZE_BUFFER => {
+            Ok(SYSCALL_LOG.lock_save_irq().total_bytes)
+        }
+        _ => Ok(0),
+    }
+}
 
 pub async fn handle_syscall() {
     current_task().update_accounting(None);
@@ -117,6 +242,8 @@ pub async fn handle_syscall() {
             state.x[5],
         )
     };
+
+    record_syscall(nr);
 
     let res = match nr {
         0x5 => {
@@ -384,6 +511,7 @@ pub async fn handle_syscall() {
                 TaskState::Finished
             ));
 
+            PREV_SYSCALL.store(nr, AtomicOrdering::Relaxed);
             // Don't process result on exit.
             return;
         }
@@ -395,6 +523,7 @@ pub async fn handle_syscall() {
                 TaskState::Finished
             ));
 
+            PREV_SYSCALL.store(nr, AtomicOrdering::Relaxed);
             // Don't process result on exit.
             return;
         }
@@ -433,6 +562,14 @@ pub async fn handle_syscall() {
             )
             .await
         }
+        // Level 3 & 4 — syslog (klogctl) ----------------------------------------
+        // syscall 0x74 is syslog/klogctl.  We use it as a kernel diagnostic:
+        //   Level 3: prints the previous syscall number to the kernel log.
+        //   Level 4: prints the full syscall history from the ring buffer
+        //            (visible via dmesg).
+        // Returns 0 to prevent a panic on unhandled syscall.
+        0x74 => sys_syslog(arg1, arg2, arg3).await,
+        // -------------------------------------------------------------------------
         0x75 => {
             sys_ptrace(
                 arg1 as _,
@@ -471,6 +608,7 @@ pub async fn handle_syscall() {
                 .ctx
                 .put_signal_work(Box::pin(ArchImpl::do_signal_return()));
 
+            PREV_SYSCALL.store(nr, AtomicOrdering::Relaxed);
             return;
         }
         0x8e => sys_reboot(arg1 as _, arg2 as _, arg3 as _, arg4 as _).await,
@@ -650,4 +788,7 @@ pub async fn handle_syscall() {
     ptrace_stop(TracePoint::SyscallExit).await;
     current_task().update_accounting(None);
     current_task().in_syscall = false;
+    // Level 3: record the completed syscall number for the next syslog call.
+    PREV_SYSCALL.store(nr, AtomicOrdering::Relaxed);
 }
+

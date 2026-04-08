@@ -3,8 +3,6 @@
 #![feature(used_with_arg)]
 #![feature(likely_unlikely)]
 #![feature(box_as_ptr)]
-#![expect(internal_features)]
-#![feature(core_intrinsics)]
 #![feature(custom_test_frameworks)]
 #![reexport_test_harness_main = "test_main"]
 #![test_runner(crate::testing::test_runner)]
